@@ -9,223 +9,68 @@ from PIL import Image
 from io import BytesIO
 
 # =========================
-# ENV
+# ENV & CONFIG
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
-
-if not TELEGRAM_TOKEN:
-    raise Exception("Missing TELEGRAM_BOT_TOKEN")
-
-if not OPENROUTER_API_KEY:
-    raise Exception("Missing OPENROUTER_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 app = Flask(__name__)
 
 # =========================
-# SEND
-# =========================
-def send(chat_id, text):
-    try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text}
-        )
-    except:
-        pass
-
-# =========================
-# WEBHOOK
-# =========================
-def ensure_webhook():
-    if not BASE_URL:
-        return
-
-    url = f"{BASE_URL}/"
-    try:
-        info = requests.get(f"{TELEGRAM_API}/getWebhookInfo").json()
-        current = info.get("result", {}).get("url", "")
-
-        if current != url:
-            requests.get(f"{TELEGRAM_API}/deleteWebhook")
-            requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": url})
-    except:
-        pass
-
-# =========================
-# SAFE JSON
-# =========================
-def safe_json(text):
-    try:
-        text = re.sub(r"```json|```", "", text).strip()
-        start = text.find("{")
-        end = text.rfind("}")
-
-        if start == -1 or end == -1:
-            return None
-
-        return json.loads(text[start:end+1])
-    except:
-        return None
-
-# =========================
-# SCORES
-# =========================
-def parse_scores(arr):
-    out = []
-    for x in arr:
-        try:
-            x = x.replace(":", "-").replace("–", "-")
-            out.append(int(x.split("-")[0]))
-        except:
-            continue
-    return out
-
-# =========================
-# IMAGE SPLIT
-# =========================
-def split_image(image_bytes):
-    img = Image.open(BytesIO(image_bytes))
-    w, h = img.size
-
-    boxes = [
-        (0, 0, w//2, h//2),
-        (w//2, 0, w, h//2),
-        (0, h//2, w//2, h),
-        (w//2, h//2, w, h),
-    ]
-
-    parts = []
-    for box in boxes:
-        crop = img.crop(box)
-        buf = BytesIO()
-        crop.save(buf, format="JPEG")
-        parts.append(buf.getvalue())
-
-    return parts
-
-# =========================
-# MULTI MODEL EXTRACTION
-# =========================
-def call_model(model, image_bytes):
-    try:
-        b64 = base64.b64encode(image_bytes).decode()
-
-        res = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Extract match data as JSON only"},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "temperature": 0
-            },
-            timeout=30
-        )
-
-        data = res.json()
-
-        if "choices" not in data:
-            print("MODEL ERROR:", data)
-            return None
-
-        return data["choices"][0]["message"]["content"]
-
-    except Exception as e:
-        print("MODEL FAIL:", model, e)
-        return None
-
-
-def extract_with_fallback(image_bytes):
-    models = [
-        "openai/gpt-4o",
-        "anthropic/claude-3.5-sonnet"
-    ]
-
-    for model in models:
-        result = call_model(model, image_bytes)
-        if result:
-            parsed = safe_json(result)
-            if parsed:
-                return parsed
-
-    return None
-
-# =========================
-# POISSON
+# CORE MATH (Poisson & EV)
 # =========================
 def poisson(l, k):
-    return (math.exp(-l) * l**k) / math.factorial(k)
+    if l <= 0: return 0
+    return (math.exp(-l) * (l**k)) / math.factorial(k)
 
-def simulate(home_l, away_l):
+def simulate(home_avg, away_avg):
+    # Apply Home Field Advantage (10% boost to home scoring)
+    h_lambda = home_avg * 1.1
+    a_lambda = away_avg
+    
     probs = {
-        "home_win": 0,
-        "draw": 0,
-        "away_win": 0,
-        "over_2_5": 0,
-        "under_2_5": 0,
-        "btts_yes": 0,
-        "btts_no": 0
+        "home_win": 0, "draw": 0, "away_win": 0,
+        "over_2_5": 0, "under_2_5": 0,
+        "btts_yes": 0, "btts_no": 0
     }
 
-    for h in range(6):
-        for a in range(6):
-            p = poisson(home_l, h) * poisson(away_l, a)
+    # Iterate up to 10 goals for higher precision
+    for h in range(10):
+        for a in range(10):
+            p = poisson(h_lambda, h) * poisson(a_lambda, a)
+            
+            if h > a: probs["home_win"] += p
+            elif h == a: probs["draw"] += p
+            else: probs["away_win"] += p
 
-            if h > a:
-                probs["home_win"] += p
-            elif h == a:
-                probs["draw"] += p
-            else:
-                probs["away_win"] += p
+            if h + a > 2.5: probs["over_2_5"] += p
+            else: probs["under_2_5"] += p
 
-            if h + a > 2:
-                probs["over_2_5"] += p
-            else:
-                probs["under_2_5"] += p
-
-            if h > 0 and a > 0:
-                probs["btts_yes"] += p
-            else:
-                probs["btts_no"] += p
-
+            if h > 0 and a > 0: probs["btts_yes"] += p
+            else: probs["btts_no"] += p
+            
     return probs
 
-# =========================
-# PICK
-# =========================
 def pick_best(probs, odds):
     best = None
     best_score = -999
 
     for k, p in probs.items():
-        if k not in odds or odds[k] is None:
+        if k not in odds or not odds[k] or odds[k] <= 1:
             continue
 
+        # Edge calculation (Expected Value)
         ev = (p * odds[k]) - 1
 
-        if ev < 0.05:
+        # SETTING: 0.02 = 2% Edge. Lower this for even more signals.
+        if ev < 0.02:
             continue
 
-        score = ev * 0.7 + p * 0.3
+        # Ranking score: Balance high probability with high value
+        score = (ev * 0.6) + (p * 0.4)
 
         if score > best_score:
             best_score = score
@@ -234,116 +79,127 @@ def pick_best(probs, odds):
     return best
 
 # =========================
-# UI
+# DATA EXTRACTION
 # =========================
-def clean(m):
-    return {
-        "home_win": "HOME WIN",
-        "away_win": "AWAY WIN",
-        "draw": "DRAW",
-        "over_2_5": "OVER 2.5",
-        "under_2_5": "UNDER 2.5",
-        "btts_yes": "BTTS YES",
-        "btts_no": "BTTS NO"
-    }.get(m, m)
+def safe_json(text):
+    try:
+        text = re.sub(r"```json|```", "", text).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        return json.loads(text[start:end+1]) if (start != -1 and end != -1) else None
+    except:
+        return None
 
-def card(market, prob, odds, ev, league, home, away):
-    return (
-        "╔═══════════════════╗\n"
-        "   ⚡ ELITE SIGNAL\n"
-        "╚═══════════════════╝\n\n"
-        f"🏟️ {home} vs {away}\n"
-        f"🌍 {league}\n\n"
-        f"🎯 {clean(market)}\n"
-        f"💸 {odds}\n\n"
-        f"📊 {round(prob*100,1)}% │ 📈 +{round(ev*100,1)}%\n"
-    )
+def parse_scores(arr):
+    out = []
+    for x in arr:
+        try:
+            clean_x = str(x).replace(":", "-").replace("–", "-")
+            score_parts = clean_x.split("-")
+            out.append(int(score_parts[0])) # Extract goals
+        except:
+            continue
+    return out
 
-PASS = "🚫 NO EDGE"
+def call_model(model, image_bytes):
+    try:
+        b64 = base64.b64encode(image_bytes).decode()
+        res = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract match data. JSON only: {league, home_team, away_team, home_last_matches: [scores like '2-1'], away_last_matches: [scores], odds: {home_win, draw, away_win, over_2_5, under_2_5, btts_yes, btts_no}}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                }],
+                "temperature": 0
+            },
+            timeout=30
+        )
+        return res.json()["choices"][0]["message"]["content"]
+    except:
+        return None
+
+# =========================
+# TELEGRAM UTILS
+# =========================
+def send(chat_id, text):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+
+def split_image(image_bytes):
+    img = Image.open(BytesIO(image_bytes))
+    w, h = img.size
+    boxes = [(0, 0, w//2, h//2), (w//2, 0, w, h//2), (0, h//2, w//2, h), (w//2, h//2, w, h)]
+    parts = []
+    for box in boxes:
+        crop = img.crop(box)
+        buf = BytesIO()
+        crop.save(buf, format="JPEG")
+        parts.append(buf.getvalue())
+    return parts
 
 # =========================
 # ROUTES
 # =========================
-@app.route("/health")
-def health():
-    return "OK"
-
 @app.route("/", methods=["POST"])
 def webhook():
-    try:
-        data = request.json
-        if "message" not in data:
-            return "ok"
+    data = request.json
+    if "message" not in data or "photo" not in data["message"]:
+        return "ok"
 
-        msg = data["message"]
-        chat_id = msg["chat"]["id"]
+    chat_id = data["message"]["chat"]["id"]
+    file_id = data["message"]["photo"][-1]["file_id"]
+    
+    # Download Image
+    f_info = requests.get(f"{TELEGRAM_API}/getFile?file_id={file_id}").json()
+    f_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{f_info['result']['file_path']}"
+    img_data = requests.get(f_url).content
 
-        if "photo" not in msg:
-            send(chat_id, "📸 Send screenshot")
-            return "ok"
+    send(chat_id, "🔍 <b>Smart Analyzing...</b>")
+    
+    parts = split_image(img_data)
+    results = []
 
-        file_id = msg["photo"][-1]["file_id"]
+    for part in parts:
+        raw_res = call_model("openai/gpt-4o", part)
+        parsed = safe_json(raw_res)
 
-        file_info = requests.get(
-            f"{TELEGRAM_API}/getFile?file_id={file_id}"
-        ).json()
+        if not parsed: continue
 
-        file_path = file_info["result"]["file_path"]
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        h_scores = parse_scores(parsed.get("home_last_matches", []))
+        a_scores = parse_scores(parsed.get("away_last_matches", []))
 
-        img = requests.get(file_url).content
+        # SETTING: Adjusted to 3 matches for higher activity
+        if len(h_scores) >= 3 and len(a_scores) >= 3:
+            h_lambda = sum(h_scores[:3]) / 3
+            a_lambda = sum(a_scores[:3]) / 3
 
-        send(chat_id, "🔍 Smart analyzing...")
-
-        parts = split_image(img)
-        results = []
-
-        for part in parts:
-            parsed = extract_with_fallback(part)
-
-            if not parsed:
-                continue
-
-            hs = parse_scores(parsed.get("home_last_matches", []))
-            as_ = parse_scores(parsed.get("away_last_matches", []))
-
-            if len(hs) < 4 or len(as_) < 4:
-                continue
-
-            home_l = sum(hs) / len(hs)
-            away_l = sum(as_) / len(as_)
-
-            probs = simulate(home_l, away_l)
+            probs = simulate(h_lambda, a_lambda)
             best = pick_best(probs, parsed.get("odds", {}))
 
             if best:
-                market, prob, odds, ev = best
-                results.append(card(
-                    market,
-                    prob,
-                    odds,
-                    ev,
-                    parsed.get("league", ""),
-                    parsed.get("home_team", ""),
-                    parsed.get("away_team", "")
-                ))
+                m, p, o, ev = best
+                card = (
+                    f"<b>🏆 {parsed.get('home_team')} vs {parsed.get('away_team')}</b>\n"
+                    f"<i>{parsed.get('league', 'International')}</i>\n\n"
+                    f"🎯 <b>PICK:</b> {str(m).upper().replace('_', ' ')}\n"
+                    f"💰 <b>ODDS:</b> {o}\n"
+                    f"📈 <b>EDGE:</b> +{round(ev*100, 1)}%\n"
+                    f"📊 <b>PROB:</b> {round(p*100, 1)}%"
+                )
+                results.append(card)
 
-        if not results:
-            send(chat_id, PASS)
-        else:
-            for r in results:
-                send(chat_id, r)
-
-    except Exception as e:
-        print("FATAL ERROR:", e)
-        send(chat_id, "❌ Error")
+    if not results:
+        send(chat_id, "🚫 <b>NO EDGE FOUND</b>\n(Odds are too tight or data insufficient)")
+    else:
+        for r in results:
+            send(chat_id, r)
 
     return "ok"
 
-# =========================
-# START
-# =========================
 if __name__ == "__main__":
-    print("🚀 Starting multi-model bot...")
-    ensure_webhook()
     app.run(host="0.0.0.0", port=10000)
