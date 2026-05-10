@@ -26,7 +26,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 app = Flask(__name__)
 
 # =========================
-# TELEGRAM SEND
+# SEND
 # =========================
 def send(chat_id, text):
     try:
@@ -38,44 +38,22 @@ def send(chat_id, text):
         pass
 
 # =========================
-# WEBHOOK AUTO SET
+# WEBHOOK
 # =========================
 def ensure_webhook():
     if not BASE_URL:
         return
 
     url = f"{BASE_URL}/"
-    info = requests.get(f"{TELEGRAM_API}/getWebhookInfo").json()
-    current = info.get("result", {}).get("url", "")
+    try:
+        info = requests.get(f"{TELEGRAM_API}/getWebhookInfo").json()
+        current = info.get("result", {}).get("url", "")
 
-    if current != url:
-        requests.get(f"{TELEGRAM_API}/deleteWebhook")
-        requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": url})
-
-# =========================
-# IMAGE SPLIT (KEY UPGRADE)
-# =========================
-def split_image(image_bytes):
-    img = Image.open(BytesIO(image_bytes))
-    w, h = img.size
-
-    parts = []
-
-    # 4 quadrants
-    boxes = [
-        (0, 0, w//2, h//2),
-        (w//2, 0, w, h//2),
-        (0, h//2, w//2, h),
-        (w//2, h//2, w, h),
-    ]
-
-    for box in boxes:
-        crop = img.crop(box)
-        buf = BytesIO()
-        crop.save(buf, format="JPEG")
-        parts.append(buf.getvalue())
-
-    return parts
+        if current != url:
+            requests.get(f"{TELEGRAM_API}/deleteWebhook")
+            requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": url})
+    except:
+        pass
 
 # =========================
 # SAFE JSON
@@ -94,7 +72,7 @@ def safe_json(text):
         return None
 
 # =========================
-# SCORE PARSER
+# SCORES
 # =========================
 def parse_scores(arr):
     out = []
@@ -107,61 +85,89 @@ def parse_scores(arr):
     return out
 
 # =========================
-# GPT-4o PER IMAGE
+# IMAGE SPLIT
 # =========================
-def extract_match(image_bytes):
-    b64 = base64.b64encode(image_bytes).decode()
+def split_image(image_bytes):
+    img = Image.open(BytesIO(image_bytes))
+    w, h = img.size
 
-    prompt = """
-Extract ONE match from this image.
+    boxes = [
+        (0, 0, w//2, h//2),
+        (w//2, 0, w, h//2),
+        (0, h//2, w//2, h),
+        (w//2, h//2, w, h),
+    ]
 
-Return ONLY JSON:
+    parts = []
+    for box in boxes:
+        crop = img.crop(box)
+        buf = BytesIO()
+        crop.save(buf, format="JPEG")
+        parts.append(buf.getvalue())
 
-{
-  "league": "",
-  "home_team": "",
-  "away_team": "",
-  "home_last_matches": [],
-  "away_last_matches": [],
-  "odds": {
-    "home_win": null,
-    "draw": null,
-    "away_win": null,
-    "over_2_5": null,
-    "under_2_5": null,
-    "btts_yes": null,
-    "btts_no": null
-  }
-}
-"""
+    return parts
 
-    res = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "openai/gpt-4o",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64}"
+# =========================
+# MULTI MODEL EXTRACTION
+# =========================
+def call_model(model, image_bytes):
+    try:
+        b64 = base64.b64encode(image_bytes).decode()
+
+        res = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract match data as JSON only"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64}"
+                                }
                             }
-                        }
-                    ]
-                }
-            ],
-            "temperature": 0
-        }
-    )
+                        ]
+                    }
+                ],
+                "temperature": 0
+            },
+            timeout=30
+        )
 
-    return res.json()["choices"][0]["message"]["content"]
+        data = res.json()
+
+        if "choices" not in data:
+            print("MODEL ERROR:", data)
+            return None
+
+        return data["choices"][0]["message"]["content"]
+
+    except Exception as e:
+        print("MODEL FAIL:", model, e)
+        return None
+
+
+def extract_with_fallback(image_bytes):
+    models = [
+        "openai/gpt-4o",
+        "anthropic/claude-3.5-sonnet"
+    ]
+
+    for model in models:
+        result = call_model(model, image_bytes)
+        if result:
+            parsed = safe_json(result)
+            if parsed:
+                return parsed
+
+    return None
 
 # =========================
 # POISSON
@@ -256,15 +262,12 @@ def card(market, prob, odds, ev, league, home, away):
 PASS = "🚫 NO EDGE"
 
 # =========================
-# HEALTH
+# ROUTES
 # =========================
 @app.route("/health")
 def health():
     return "OK"
 
-# =========================
-# WEBHOOK
-# =========================
 @app.route("/", methods=["POST"])
 def webhook():
     try:
@@ -288,17 +291,15 @@ def webhook():
         file_path = file_info["result"]["file_path"]
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
-        img_bytes = requests.get(file_url).content
+        img = requests.get(file_url).content
 
-        send(chat_id, "🔍 Splitting & analyzing...")
+        send(chat_id, "🔍 Smart analyzing...")
 
-        parts = split_image(img_bytes)
-
+        parts = split_image(img)
         results = []
 
         for part in parts:
-            raw = extract_match(part)
-            parsed = safe_json(raw)
+            parsed = extract_with_fallback(part)
 
             if not parsed:
                 continue
@@ -334,7 +335,7 @@ def webhook():
                 send(chat_id, r)
 
     except Exception as e:
-        print("ERROR:", e)
+        print("FATAL ERROR:", e)
         send(chat_id, "❌ Error")
 
     return "ok"
@@ -343,6 +344,6 @@ def webhook():
 # START
 # =========================
 if __name__ == "__main__":
-    print("🚀 Starting...")
+    print("🚀 Starting multi-model bot...")
     ensure_webhook()
     app.run(host="0.0.0.0", port=10000)
