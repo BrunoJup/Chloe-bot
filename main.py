@@ -2,17 +2,26 @@ import os
 import json
 import math
 import base64
+import re
 import requests
 from flask import Flask, request
+from PIL import Image
+from io import BytesIO
 
 # =========================
 # ENV
 # =========================
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+if not TELEGRAM_TOKEN:
+    raise Exception("Missing TELEGRAM_BOT_TOKEN")
+
+if not OPENROUTER_API_KEY:
+    raise Exception("Missing OPENROUTER_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 app = Flask(__name__)
 
@@ -29,72 +38,101 @@ def send(chat_id, text):
         pass
 
 # =========================
-# AUTO WEBHOOK MANAGER
+# WEBHOOK AUTO SET
 # =========================
-def get_webhook():
-    return requests.get(f"{TELEGRAM_API}/getWebhookInfo").json()
-
-def set_webhook(url):
-    return requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": url}).json()
-
-def delete_webhook():
-    return requests.get(f"{TELEGRAM_API}/deleteWebhook").json()
-
 def ensure_webhook():
     if not BASE_URL:
-        print("⚠️ No BASE_URL found")
         return
 
     url = f"{BASE_URL}/"
-
-    info = get_webhook()
+    info = requests.get(f"{TELEGRAM_API}/getWebhookInfo").json()
     current = info.get("result", {}).get("url", "")
 
     if current != url:
-        print("🔄 Fixing webhook...")
-        delete_webhook()
-        set_webhook(url)
-        print("✅ Webhook set:", url)
-    else:
-        print("✅ Webhook OK")
+        requests.get(f"{TELEGRAM_API}/deleteWebhook")
+        requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": url})
 
 # =========================
-# GPT-4o VISION EXTRACTION
+# IMAGE SPLIT (KEY UPGRADE)
 # =========================
-def extract_matches(image_bytes):
+def split_image(image_bytes):
+    img = Image.open(BytesIO(image_bytes))
+    w, h = img.size
+
+    parts = []
+
+    # 4 quadrants
+    boxes = [
+        (0, 0, w//2, h//2),
+        (w//2, 0, w, h//2),
+        (0, h//2, w//2, h),
+        (w//2, h//2, w, h),
+    ]
+
+    for box in boxes:
+        crop = img.crop(box)
+        buf = BytesIO()
+        crop.save(buf, format="JPEG")
+        parts.append(buf.getvalue())
+
+    return parts
+
+# =========================
+# SAFE JSON
+# =========================
+def safe_json(text):
+    try:
+        text = re.sub(r"```json|```", "", text).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start == -1 or end == -1:
+            return None
+
+        return json.loads(text[start:end+1])
+    except:
+        return None
+
+# =========================
+# SCORE PARSER
+# =========================
+def parse_scores(arr):
+    out = []
+    for x in arr:
+        try:
+            x = x.replace(":", "-").replace("–", "-")
+            out.append(int(x.split("-")[0]))
+        except:
+            continue
+    return out
+
+# =========================
+# GPT-4o PER IMAGE
+# =========================
+def extract_match(image_bytes):
     b64 = base64.b64encode(image_bytes).decode()
 
     prompt = """
-Extract ALL matches from this eFootball screenshot.
+Extract ONE match from this image.
 
 Return ONLY JSON:
 
 {
-  "matches": [
-    {
-      "league": "",
-      "home_team": "",
-      "away_team": "",
-      "home_last_matches": ["2-1","1-0","3-2","2-2","0-1"],
-      "away_last_matches": ["1-1","0-2","2-1","1-0","2-3"],
-      "odds": {
-        "home_win": null,
-        "draw": null,
-        "away_win": null,
-        "over_2_5": null,
-        "under_2_5": null,
-        "btts_yes": null,
-        "btts_no": null
-      }
-    }
-  ]
+  "league": "",
+  "home_team": "",
+  "away_team": "",
+  "home_last_matches": [],
+  "away_last_matches": [],
+  "odds": {
+    "home_win": null,
+    "draw": null,
+    "away_win": null,
+    "over_2_5": null,
+    "under_2_5": null,
+    "btts_yes": null,
+    "btts_no": null
+  }
 }
-
-Rules:
-- Extract ALL visible matches
-- Do NOT guess missing values
-- Normalize scores X-Y
-- Convert odds to decimal
 """
 
     res = requests.post(
@@ -126,7 +164,7 @@ Rules:
     return res.json()["choices"][0]["message"]["content"]
 
 # =========================
-# MATH ENGINE
+# POISSON
 # =========================
 def poisson(l, k):
     return (math.exp(-l) * l**k) / math.factorial(k)
@@ -166,19 +204,9 @@ def simulate(home_l, away_l):
     return probs
 
 # =========================
-# FILTERS
+# PICK
 # =========================
-def valid(prob, odds, ev):
-    if ev < 0.05:
-        return False
-    if prob > 0.80:
-        return False
-    return True
-
-# =========================
-# BEST PICK
-# =========================
-def pick_best(probs, odds, data):
+def pick_best(probs, odds):
     best = None
     best_score = -999
 
@@ -188,7 +216,7 @@ def pick_best(probs, odds, data):
 
         ev = (p * odds[k]) - 1
 
-        if not valid(p, odds[k], ev):
+        if ev < 0.05:
             continue
 
         score = ev * 0.7 + p * 0.3
@@ -200,7 +228,7 @@ def pick_best(probs, odds, data):
     return best
 
 # =========================
-# UI CARD
+# UI
 # =========================
 def clean(m):
     return {
@@ -211,7 +239,7 @@ def clean(m):
         "under_2_5": "UNDER 2.5",
         "btts_yes": "BTTS YES",
         "btts_no": "BTTS NO"
-    }.get(m, m.upper())
+    }.get(m, m)
 
 def card(market, prob, odds, ev, league, home, away):
     return (
@@ -225,11 +253,14 @@ def card(market, prob, odds, ev, league, home, away):
         f"📊 {round(prob*100,1)}% │ 📈 +{round(ev*100,1)}%\n"
     )
 
-PASS = (
-    "╔═══════════════════╗\n"
-    "   🚫 NO EDGE\n"
-    "╚═══════════════════╝"
-)
+PASS = "🚫 NO EDGE"
+
+# =========================
+# HEALTH
+# =========================
+@app.route("/health")
+def health():
+    return "OK"
 
 # =========================
 # WEBHOOK
@@ -257,52 +288,53 @@ def webhook():
         file_path = file_info["result"]["file_path"]
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
 
-        img = requests.get(file_url).content
+        img_bytes = requests.get(file_url).content
 
-        send(chat_id, "🔍 Analyzing...")
+        send(chat_id, "🔍 Splitting & analyzing...")
 
-        raw = extract_matches(img)
-        parsed = json.loads(raw)
+        parts = split_image(img_bytes)
 
         results = []
 
-        for m in parsed.get("matches", []):
-            home = m["home_team"]
-            away = m["away_team"]
+        for part in parts:
+            raw = extract_match(part)
+            parsed = safe_json(raw)
 
-            hs = [int(x.split("-")[0]) for x in m["home_last_matches"]]
-            as_ = [int(x.split("-")[0]) for x in m["away_last_matches"]]
+            if not parsed:
+                continue
 
-            if len(hs) < 4:
+            hs = parse_scores(parsed.get("home_last_matches", []))
+            as_ = parse_scores(parsed.get("away_last_matches", []))
+
+            if len(hs) < 4 or len(as_) < 4:
                 continue
 
             home_l = sum(hs) / len(hs)
             away_l = sum(as_) / len(as_)
 
             probs = simulate(home_l, away_l)
-
-            best = pick_best(probs, m["odds"], m)
+            best = pick_best(probs, parsed.get("odds", {}))
 
             if best:
                 market, prob, odds, ev = best
-
                 results.append(card(
                     market,
                     prob,
                     odds,
                     ev,
-                    m["league"],
-                    home,
-                    away
+                    parsed.get("league", ""),
+                    parsed.get("home_team", ""),
+                    parsed.get("away_team", "")
                 ))
 
         if not results:
             send(chat_id, PASS)
         else:
-            for r in results[:3]:
+            for r in results:
                 send(chat_id, r)
 
-    except Exception:
+    except Exception as e:
+        print("ERROR:", e)
         send(chat_id, "❌ Error")
 
     return "ok"
@@ -311,6 +343,6 @@ def webhook():
 # START
 # =========================
 if __name__ == "__main__":
-    print("🚀 Bot starting...")
+    print("🚀 Starting...")
     ensure_webhook()
     app.run(host="0.0.0.0", port=10000)
